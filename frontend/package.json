@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node scripts/bundle-api.mjs",
+    "build": "tsc -b && vite build && node scripts/bundle-api.mjs && node scripts/test-api-mjs.mjs",
     "preview": "vite preview",
     "bundle-api": "node scripts/bundle-api.mjs"
   },
