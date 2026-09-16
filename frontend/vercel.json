@@ -1,0 +1,7 @@
+{
+  "rewrites": [
+    { "source": "/health", "destination": "/api/mock" },
+    { "source": "/api/v1/:path*", "destination": "/api/mock" },
+    { "source": "/api/v1", "destination": "/api/mock" }
+  ]
+}

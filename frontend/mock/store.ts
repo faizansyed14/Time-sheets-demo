@@ -6,6 +6,8 @@ import { fileURLToPath } from "url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const STORE_PATH = join(here, "..", ".demo-store.json");
+/** Vercel serverless: no writable disk — in-memory seed per warm instance. */
+const serverlessDemo = !!process.env.VERCEL;
 
 let store: SeedData | null = null;
 let seq = 100;
@@ -52,7 +54,7 @@ function stripPdfs(s: SeedData): Omit<SeedData, "pdfs"> {
 }
 
 export function saveStore(): void {
-  if (!store) return;
+  if (!store || serverlessDemo) return;
   try {
     const payload: Persisted = { seq, data: stripPdfs(store) };
     writeFileSync(STORE_PATH, JSON.stringify(payload), "utf8");
@@ -70,6 +72,7 @@ export function scheduleSave(): void {
 }
 
 function loadFromDisk(): SeedData | null {
+  if (serverlessDemo) return null;
   try {
     if (!existsSync(STORE_PATH)) return null;
     const raw = JSON.parse(readFileSync(STORE_PATH, "utf8")) as Persisted;
@@ -91,9 +94,11 @@ export function getStore(): SeedData {
 
 /** Wipe persisted demo + reload seed defaults. */
 export function resetStore(): SeedData {
-  try {
-    if (existsSync(STORE_PATH)) unlinkSync(STORE_PATH);
-  } catch { /* ignore */ }
+  if (!serverlessDemo) {
+    try {
+      if (existsSync(STORE_PATH)) unlinkSync(STORE_PATH);
+    } catch { /* ignore */ }
+  }
   store = buildSeed();
   seq = 100;
   ensurePublicDemoPdfs(store);
