@@ -2,9 +2,13 @@
 // would, and drive a fake login request through it. Catches import/runtime
 // errors (module-not-found, ESM/CJS mismatch, etc.) before deploying.
 import { createServer } from "http";
+import { createRequire } from "module";
 
-const mod = await import("../api/mock.mjs");
-const handler = mod.default;
+// Simulate Vercel's runtime, which require()s the CJS function (not ESM
+// import()) — that avoids Node's double-`.default` synthetic-module wrap.
+const require = createRequire(import.meta.url);
+const mod = require("../api/mock.js");
+const handler = typeof mod === "function" ? mod : mod.default;
 
 // Vercel populates req.query from rewrite params (?__sub=...); a plain
 // http.IncomingMessage doesn't have that, so attach it manually here.

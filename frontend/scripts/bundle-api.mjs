@@ -10,9 +10,11 @@ import { fileURLToPath } from "url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 mkdirSync(join(root, "api"), { recursive: true });
 
-// Output pure ESM (.mjs) — frontend/package.json has "type":"module", so a
-// bundled .js file would be parsed as ESM anyway but with CJS syntax inside
-// (module.exports), causing "exports is not defined". .mjs is unambiguous.
+// Vercel's Node builder repackages every function as api/<name>.js inside
+// the deployed lambda regardless of our source extension (.mjs got renamed
+// back to .js in production, which then broke under the root "type":"module").
+// Fix: output CJS + a nested api/package.json{"type":"commonjs"} scopes this
+// folder back to CommonJS regardless of what Vercel names the output file.
 await esbuild.build({
   entryPoints: {
     mock: join(root, "mock", "vercel-mock-entry.ts"),
@@ -21,10 +23,9 @@ await esbuild.build({
   bundle: true,
   platform: "node",
   target: "node20",
-  format: "esm",
+  format: "cjs",
   outdir: join(root, "api"),
-  outExtension: { ".js": ".mjs" },
   logLevel: "info",
 });
 
-console.log("[bundle-api] wrote api/mock.mjs and api/health.mjs");
+console.log("[bundle-api] wrote api/mock.js and api/health.js");

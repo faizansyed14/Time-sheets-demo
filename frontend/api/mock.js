@@ -1,3 +1,30 @@
+"use strict";
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+// mock/vercel-mock-entry.ts
+var vercel_mock_entry_exports = {};
+__export(vercel_mock_entry_exports, {
+  config: () => config,
+  default: () => handler
+});
+module.exports = __toCommonJS(vercel_mock_entry_exports);
+
 // mock/pdf.ts
 var MONTHS = [
   "",
@@ -1161,9 +1188,9 @@ function buildSeed() {
 }
 
 // mock/store.ts
-import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync } from "fs";
-import { join } from "path";
-var STORE_PATH = join(process.cwd(), ".demo-store.json");
+var import_fs = require("fs");
+var import_path = require("path");
+var STORE_PATH = (0, import_path.join)(process.cwd(), ".demo-store.json");
 var serverlessDemo = !!process.env.VERCEL;
 var store = null;
 var seq = 100;
@@ -1175,15 +1202,15 @@ function nextId(prefix) {
 }
 function ensurePublicDemoPdfs(s) {
   try {
-    const publicDir = join(process.cwd(), "public", "demo");
-    if (!existsSync(publicDir)) mkdirSync(publicDir, { recursive: true });
+    const publicDir = (0, import_path.join)(process.cwd(), "public", "demo");
+    if (!(0, import_fs.existsSync)(publicDir)) (0, import_fs.mkdirSync)(publicDir, { recursive: true });
     const samples = [
       ["aisha-timesheet.pdf", s.pdfs["ts-emp-001-" + (/* @__PURE__ */ new Date()).getFullYear() + "-" + ((/* @__PURE__ */ new Date()).getMonth() + 1)] ?? makeTimesheetPdf("Aisha Rahman", (/* @__PURE__ */ new Date()).getMonth() + 1, (/* @__PURE__ */ new Date()).getFullYear())],
       ["omar-timesheet.pdf", makeTimesheetPdf("Omar Hassan", (/* @__PURE__ */ new Date()).getMonth() + 1, (/* @__PURE__ */ new Date()).getFullYear())],
       ["demo-sheet.pdf", s.pdfs["generic"] ?? makeTimesheetPdf("Demo Employee", 1, 2026)]
     ];
     for (const [name, buf] of samples) {
-      writeFileSync(join(publicDir, name), buf);
+      (0, import_fs.writeFileSync)((0, import_path.join)(publicDir, name), buf);
     }
   } catch {
   }
@@ -1200,7 +1227,7 @@ function saveStore() {
   if (!store || serverlessDemo) return;
   try {
     const payload = { seq, data: stripPdfs(store) };
-    writeFileSync(STORE_PATH, JSON.stringify(payload), "utf8");
+    (0, import_fs.writeFileSync)(STORE_PATH, JSON.stringify(payload), "utf8");
   } catch (err) {
     console.warn("[demo-store] save failed", err);
   }
@@ -1215,8 +1242,8 @@ function scheduleSave() {
 function loadFromDisk() {
   if (serverlessDemo) return null;
   try {
-    if (!existsSync(STORE_PATH)) return null;
-    const raw = JSON.parse(readFileSync(STORE_PATH, "utf8"));
+    if (!(0, import_fs.existsSync)(STORE_PATH)) return null;
+    const raw = JSON.parse((0, import_fs.readFileSync)(STORE_PATH, "utf8"));
     if (!raw?.data?.users) return null;
     seq = typeof raw.seq === "number" ? raw.seq : 100;
     return attachPdfs(raw.data);
@@ -1234,7 +1261,7 @@ function getStore() {
 function resetStore() {
   if (!serverlessDemo) {
     try {
-      if (existsSync(STORE_PATH)) unlinkSync(STORE_PATH);
+      if ((0, import_fs.existsSync)(STORE_PATH)) (0, import_fs.unlinkSync)(STORE_PATH);
     } catch {
     }
   }
@@ -3104,15 +3131,15 @@ function runMockOnVercel(req, res) {
   });
 }
 
-// mock/vercel-health-entry.ts
+// mock/vercel-mock-entry.ts
 function handler(req, res) {
-  req.url = "/health";
   runMockOnVercel(req, res);
 }
 var config = {
-  api: { bodyParser: false }
+  api: { bodyParser: false },
+  maxDuration: 30
 };
-export {
-  config,
-  handler as default
-};
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  config
+});
