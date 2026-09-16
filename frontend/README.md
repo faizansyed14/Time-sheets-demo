@@ -29,7 +29,7 @@ OTP / TOTP / captcha challenges (if you hit those flows) accept code **`123456`*
 
 1. Import repo; **Root Directory** = `frontend`
 2. Framework **Vite**; Build `npm run build`; Output **`dist`**
-3. Push — `vercel.json` routes `/health` and `/api/v1/*` to a free serverless function (`api/mock.ts`)
+3. Push — `api/v1/[[...path]].ts` serves `/api/v1/*`; `/health` rewrites to `api/health.ts` (Hobby serverless, $0)
 
 Demo data on Vercel is **in-memory** (resets on cold start; edits may not persist across instances). Local dev still uses `.demo-store.json`.
 

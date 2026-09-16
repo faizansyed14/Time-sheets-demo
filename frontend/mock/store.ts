@@ -1,11 +1,9 @@
 import { buildSeed, type SeedData } from "./seed";
 import { makeTimesheetPdf } from "./pdf";
 import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync } from "fs";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
+import { join } from "path";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const STORE_PATH = join(here, "..", ".demo-store.json");
+const STORE_PATH = join(process.cwd(), ".demo-store.json");
 /** Vercel serverless: no writable disk — in-memory seed per warm instance. */
 const serverlessDemo = !!process.env.VERCEL;
 
@@ -21,7 +19,7 @@ export function nextId(prefix: string): string {
 
 function ensurePublicDemoPdfs(s: SeedData) {
   try {
-    const publicDir = join(here, "..", "public", "demo");
+    const publicDir = join(process.cwd(), "public", "demo");
     if (!existsSync(publicDir)) mkdirSync(publicDir, { recursive: true });
     const samples: [string, Buffer][] = [
       ["aisha-timesheet.pdf", s.pdfs["ts-emp-001-" + new Date().getFullYear() + "-" + (new Date().getMonth() + 1)]

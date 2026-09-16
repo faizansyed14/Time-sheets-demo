@@ -1,7 +1,8 @@
 {
-  "rewrites": [
-    { "source": "/health", "destination": "/api/mock" },
-    { "source": "/api/v1/:path*", "destination": "/api/mock" },
-    { "source": "/api/v1", "destination": "/api/mock" }
-  ]
+  "rewrites": [{ "source": "/health", "destination": "/api/health" }],
+  "functions": {
+    "api/**/*.ts": {
+      "includeFiles": "mock/**"
+    }
+  }
 }
