@@ -29,7 +29,7 @@ OTP / TOTP / captcha challenges (if you hit those flows) accept code **`123456`*
 
 1. Import repo; **Root Directory** = `frontend`
 2. Framework **Vite**; Build `npm run build`; Output **`dist`**
-3. Push — `vercel.json` rewrites `/api/v1/*` → `api/mock.ts` (flat `/api` only on Vite; no nested catch-all)
+3. Push — build runs `scripts/bundle-api.mjs` → single CJS `api/mock.js` + `api/health.js` (fixes ESM module-not-found on Vercel)
 
 Demo data on Vercel is **in-memory** (resets on cold start; edits may not persist across instances). Local dev still uses `.demo-store.json`.
 
