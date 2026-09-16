@@ -1,8 +1,25 @@
 import type { IncomingMessage, ServerResponse } from "http";
+import type { VercelRequest } from "@vercel/node";
 import { mockMiddleware } from "./router";
 
-/** Preserve original path when Vercel rewrites or strips req.url. */
-function requestUrl(req: IncomingMessage): string {
+type ApiReq = IncomingMessage & { query?: VercelRequest["query"] };
+
+/** Preserve path through Vercel rewrite → /api/mock. */
+function requestUrl(req: ApiReq): string {
+  const sub = req.query?.__sub;
+  if (sub !== undefined) {
+    const tail = typeof sub === "string" ? sub : Array.isArray(sub) ? sub.join("/") : "";
+    const path = `/api/v1${tail ? `/${tail}` : ""}`;
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(req.query || {})) {
+      if (k === "__sub") continue;
+      if (Array.isArray(v)) v.forEach((x) => q.append(k, x));
+      else if (v != null) q.set(k, String(v));
+    }
+    const qs = q.toString();
+    return qs ? `${path}?${qs}` : path;
+  }
+
   const h = req.headers;
   const fromHeader =
     (typeof h["x-vercel-original-url"] === "string" && h["x-vercel-original-url"]) ||
@@ -11,16 +28,14 @@ function requestUrl(req: IncomingMessage): string {
   if (fromHeader) {
     return fromHeader.startsWith("/") ? fromHeader : `/${fromHeader}`;
   }
+
   const raw = req.url || "/";
-  if (raw === "/api/mock" || raw.startsWith("/api/mock?")) {
-    return "/api/v1/";
-  }
+  if (raw.startsWith("/api/v1")) return raw;
   return raw;
 }
 
-export function runMockOnVercel(req: IncomingMessage, res: ServerResponse): void {
-  const url = requestUrl(req);
-  (req as IncomingMessage & { url?: string }).url = url;
+export function runMockOnVercel(req: ApiReq, res: ServerResponse): void {
+  (req as IncomingMessage & { url?: string }).url = requestUrl(req);
   mockMiddleware(req, res, () => {
     if (!res.headersSent) {
       res.statusCode = 404;

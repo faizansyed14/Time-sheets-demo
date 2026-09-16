@@ -1,7 +1,14 @@
 {
-  "rewrites": [{ "source": "/health", "destination": "/api/health" }],
+  "rewrites": [
+    { "source": "/health", "destination": "/api/health" },
+    { "source": "/api/v1/(.*)", "destination": "/api/mock?__sub=$1" },
+    { "source": "/api/v1", "destination": "/api/mock?__sub=" }
+  ],
   "functions": {
-    "api/**/*.ts": {
+    "api/mock.ts": {
+      "includeFiles": "mock/**"
+    },
+    "api/health.ts": {
       "includeFiles": "mock/**"
     }
   }
