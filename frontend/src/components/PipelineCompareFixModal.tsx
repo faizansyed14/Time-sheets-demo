@@ -1,0 +1,1132 @@
+/**
+ * Full-screen compare & fix overlay for failed / needs-review pipeline files.
+ *
+ * Layout:
+ *   LEFT  — full manual entry form (employee, period, all 6 leave buckets,
+ *            optional file attachments, note)
+ *   RIGHT — original file preview (EML viewer, PDF iframe, or image)
+ *
+ * On "Save & file record" → calls pipelineManualFix which:
+ *   1. Creates / merges the monthly record with the entered dates (no LLM)
+ *   2. Updates the original pipeline tracker to SUCCESS / resolved
+ *   3. Purges the S3 raw copy (_pipeline-raw)
+ */
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { useQuery } from "@tanstack/react-query";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Columns2,
+  Download,
+  FileText,
+  Maximize2,
+  Minimize2,
+  Paperclip,
+  PencilLine,
+  Plus,
+  Search,
+  Sparkles,
+  Trash2,
+  Undo2,
+  User,
+  X,
+} from "lucide-react";
+import {
+  attachmentRenderUrl,
+  attachmentUrl,
+  fetchThread,
+  fetchEmployeeMatcher,
+  fetchPortalSubmissionAdmin,
+  portalSendBack,
+  deletePipelineFile,
+  pipelineManualFix,
+  pipelineRawRenderUrl,
+  pipelineRawUrl,
+  MONTHS_LONG,
+  type Employee,
+  type PipelineFile,
+  type ThreadSummary,
+} from "../api/client";
+import { ATTACHABLE_FILE_RE, attachmentRenderUrlIfSupported } from "../lib/filePreview";
+import { isBodyJunkImage } from "../lib/attachmentFilters";
+import { SourcePreview } from "./FilePreview";
+import { ThreadSummaryBox } from "./ThreadSummaryBox";
+import { Button, Input, Modal, Select, Spinner } from "./ui";
+import { cn, filterEmployees, formatBytes } from "../lib/utils";
+import { useToast } from "./toast";
+
+// ---------------------------------------------------------------------------
+// Leave bucket definitions
+// ---------------------------------------------------------------------------
+import { leaveBucketDefs } from "../lib/theme";
+
+const BUCKETS = leaveBucketDefs() as readonly { key: string; label: string; tone: string }[];
+
+// ---------------------------------------------------------------------------
+// Month day-picker — a calendar that shows ONLY the record's month, so a date
+// from another month can never be added by mistake. Click a day to toggle it.
+// ---------------------------------------------------------------------------
+const WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"] as const;
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+function MonthDayPicker({
+  year,
+  month,
+  selected,
+  tone,
+  onToggle,
+}: {
+  year: number;
+  month: number; // 1-12
+  selected: string[];
+  tone: string;
+  onToggle: (iso: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const firstDow = new Date(year, month - 1, 1).getDay(); // 0 = Sunday
+  const iso = (d: number) => `${year}-${pad2(month)}-${pad2(d)}`;
+  const selSet = new Set(selected);
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="inline-flex items-center gap-1 rounded-md bg-brand-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-brand-700"
+      >
+        <Plus className="h-3.5 w-3.5" /> Add day
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full z-30 mt-1 w-[230px] rounded-lg border border-slate-200 bg-white p-2.5 shadow-pop">
+          <p className="mb-1.5 text-center text-[11px] font-semibold text-slate-600">
+            {MONTHS_LONG[month]} {year}
+          </p>
+          <div className="grid grid-cols-7 gap-0.5 text-center text-[9px] font-bold uppercase text-slate-400">
+            {WEEKDAYS.map((d, i) => (
+              <div key={i}>{d}</div>
+            ))}
+          </div>
+          <div className="mt-0.5 grid grid-cols-7 gap-0.5">
+            {Array.from({ length: firstDow }).map((_, i) => (
+              <div key={`blank-${i}`} />
+            ))}
+            {Array.from({ length: daysInMonth }).map((_, i) => {
+              const day = i + 1;
+              const on = selSet.has(iso(day));
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  onClick={() => onToggle(iso(day))}
+                  className={cn(
+                    "flex h-7 items-center justify-center rounded text-[11px] font-medium transition-colors",
+                    on
+                      ? cn("ring-1 ring-inset", tone)
+                      : "text-slate-700 hover:bg-slate-100"
+                  )}
+                >
+                  {day}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Employee search (inline, no modal wrapper)
+// ---------------------------------------------------------------------------
+function EmployeePicker({
+  employees,
+  isLoading,
+  value,
+  valuePk,
+  onChange,
+  onPick,
+}: {
+  employees: Employee[] | undefined;
+  isLoading: boolean;
+  value: string;
+  valuePk: string;
+  onChange: (q: string) => void;
+  onPick: (e: Employee) => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  const matches = useMemo(
+    () => filterEmployees(employees, value).slice(0, 25),
+    [employees, value]
+  );
+
+  return (
+    <div className="relative">
+      <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+      <Input
+        value={value}
+        onChange={(e) => { onChange(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        placeholder="Search name or ID…"
+        className="pl-9"
+        autoComplete="off"
+      />
+      {open && (
+        <div className="absolute z-20 mt-1 max-h-52 w-full overflow-y-auto rounded-lg border border-slate-200 bg-white shadow-pop">
+          {isLoading ? (
+            <div className="flex justify-center py-6"><Spinner /></div>
+          ) : matches.length === 0 ? (
+            <p className="px-3 py-4 text-sm text-slate-400">No employees match.</p>
+          ) : (
+            matches.map((e) => (
+              <button
+                key={e.id}
+                type="button"
+                onMouseDown={(ev) => ev.preventDefault()}
+                onClick={() => { onPick(e); setOpen(false); }}
+                className={cn(
+                  "flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-brand-50",
+                  valuePk === e.id && "bg-brand-50"
+                )}
+              >
+                <User className="h-4 w-4 shrink-0 text-slate-400" />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate font-medium text-slate-800">{e.name}</span>
+                  <span className="block truncate text-xs text-slate-500">
+                    {e.employee_id}{e.location ? ` · ${e.location}` : ""}{e.project ? ` · ${e.project}` : ""}{e.account_manager ? ` · ${e.account_manager}` : ""}
+                  </span>
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Right-side preview panes
+function RawFilePreview({ file }: { file: PipelineFile }) {
+  return (
+    <SourcePreview
+      url={pipelineRawUrl(file.id)}
+      renderUrl={pipelineRawRenderUrl(file.id)}
+      name={file.filename ?? "file"}
+      ct={file.content_type ?? ""}
+    />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Plain-English reasons the AI held a record for review
+// ---------------------------------------------------------------------------
+// auto_accept.py's blocker strings are written for someone who already knows
+// the pipeline ("unrecognised timesheet template", "validation flags: ...").
+// These rewrites are for the person actually opening this screen, who just
+// needs to know what to check before they click Accept. Anything not covered
+// still shows (capitalised) rather than being hidden.
+const BLOCKER_REWRITES: [RegExp, (m: RegExpMatchArray) => string][] = [
+  [/^employee is not matched.*$/i,
+    () => "We couldn't match the name or ID on this file to anyone in your employee list."],
+  [/^no month\/year could be read.*$/i,
+    () => "We couldn't tell which month this timesheet is for."],
+  [/^unrecognised timesheet template.*$/i,
+    () => "This timesheet's layout isn't one we recognise yet."],
+  [/^validation flags:\s*(.*)$/i,
+    (m) => `Something on the sheet needs a look: ${m[1]}`],
+  [/^not a verifiable full-month daily grid\s*(.*)$/i,
+    (m) => `We couldn't confirm every day of the month is on this sheet${m[1] ? ` ${m[1]}` : ""}.`],
+  [/^the sheet is missing rows for\s*(.*)$/i,
+    (m) => `Some days are missing from the sheet: ${m[1]}`],
+  [/^auto-file failed:\s*(.*)$/i,
+    (m) => `Something went wrong saving it automatically: ${m[1]}`],
+];
+
+function humanizeBlocker(raw: string): string {
+  const text = raw.trim();
+  for (const [pattern, rewrite] of BLOCKER_REWRITES) {
+    const m = text.match(pattern);
+    if (m) return rewrite(m);
+  }
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+// ---------------------------------------------------------------------------
+// Main modal
+// ---------------------------------------------------------------------------
+export default function PipelineCompareFixModal({
+  file,
+  onClose,
+  onSaved,
+  onDiscarded,
+}: {
+  file: PipelineFile | null;
+  onClose: () => void;
+  onSaved: () => void;
+  onDiscarded?: () => void;
+}) {
+  const { toast } = useToast();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const prevFileId = useRef<string | null>(null);
+
+  // Form state
+  const [employeeQ, setEmployeeQ] = useState("");
+  const [employeePk, setEmployeePk] = useState("");
+  const [month, setMonth] = useState(new Date().getMonth() + 1);
+  const [year, setYear] = useState(new Date().getFullYear());
+  const [dates, setDates] = useState<Record<string, string[]>>({});
+  const [attachments, setAttachments] = useState<File[]>([]);
+  const [note, setNote] = useState("");
+  const [approved, setApproved] = useState(false);
+  const [approvalDetail, setApprovalDetail] = useState("");
+  const [approvalWeak, setApprovalWeak] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [sendBackOpen, setSendBackOpen] = useState(false);
+  const [sendBackNote, setSendBackNote] = useState("");
+  // The right-side preview only ever gets half the modal's width — plenty
+  // for a PDF/EML, too cramped to read a dense spreadsheet or scanned photo
+  // even at 100%+ zoom. This lets the reviewer collapse the left form away
+  // and give the preview the WHOLE modal instead.
+  const [previewExpanded, setPreviewExpanded] = useState(false);
+
+  const { data: employees, isLoading } = useQuery({
+    queryKey: ["employee-matcher"],
+    queryFn: fetchEmployeeMatcher,
+    enabled: !!file,
+  });
+
+  // Thread-wide attachments: every real document/screenshot attachment across
+  // the whole conversation (not just the one anchor email) — switchable in
+  // the right panel so the reviewer can cross-check without leaving Compare
+  // & Fix. The full thread itself (every raw message) is already viewable via
+  // the "Staged file" tab, which is the stored wrapper .eml with each message
+  // nested inside it — no separate per-message tab needed (and fetching each
+  // message's own .eml on click was slow for no benefit over that).
+  type ActiveTab = { kind: "staged" } | { kind: "doc"; id: string };
+  const [activeTab, setActiveTab] = useState<ActiveTab>({ kind: "staged" });
+  const emailSourceId = file?.source_kind === "email" ? file.source_id : null;
+  const { data: thread } = useQuery({
+    queryKey: ["email-thread", emailSourceId],
+    queryFn: () => fetchThread(emailSourceId!),
+    enabled: !!emailSourceId,
+    staleTime: 60_000,
+  });
+
+  // A portal file's source_id is "portal:<submission_id>:<kind>" — the
+  // submission's manager decision lives on PortalSubmission, not in this
+  // file's own extraction_meta, and extraction runs on Submit independent of
+  // when (or whether yet) the manager has decided — so what got baked in at
+  // staging time is frequently stale or simply "not decided yet." Fetching
+  // live here is the only way "Manager approval" below can ever be right.
+  const portalSubmissionId = file?.source_kind === "portal" ? file.source_id?.split(":")[1] ?? null : null;
+  const { data: portalSubmission } = useQuery({
+    queryKey: ["portal-submission-admin", portalSubmissionId],
+    queryFn: () => fetchPortalSubmissionAdmin(portalSubmissionId!),
+    enabled: !!portalSubmissionId,
+    staleTime: 10_000,
+  });
+  const docTabs = useMemo(() => {
+    if (!thread) return [] as {
+      id: string; filename: string; ct: string; url: string; renderUrl?: string;
+    }[];
+    return thread.messages.flatMap((m) =>
+      (m.attachments ?? [])
+        .filter((a) => !isBodyJunkImage(a, m.inline_attachment_ids))   // skip signature/logo images
+        .map((a) => ({
+          id: `${m.provider_message_id}:${a.attachment_id}`,
+          filename: a.filename,
+          ct: a.content_type,
+          url: attachmentUrl(m.provider_message_id, a.attachment_id),
+          renderUrl: attachmentRenderUrlIfSupported(
+            a.filename, a.content_type,
+            attachmentRenderUrl(m.provider_message_id, a.attachment_id)),
+        })));
+  }, [thread]);
+  const activeDoc = activeTab.kind === "doc" ? docTabs.find((d) => d.id === activeTab.id) ?? null : null;
+
+  const isStaged = file?.failure_code === "pending_review";
+  const aiRecommends = !!(isStaged && file?.auto_accepted);
+  const fullEmail = (file?.extraction_meta?.full_email_extract ?? null) as {
+    sheets?: {
+      filename: string; kind: string; leave_days?: number;
+      manager_signature?: boolean;
+      approval_evidence?: string;
+      employee_name?: string | null;
+      employee_id?: string | null;
+    }[];
+    approval?: { detected: boolean; detail: string };
+    /** Pass 1's plain-English read of the whole conversation. */
+    thread_summary?: ThreadSummary;
+    /** Fallback one-line headline for older runs without a thread_summary. */
+    summary?: string;
+    /** One entry per batch/message this run could NOT read (a model call
+     * that failed after its own retries, or a long thread's older messages
+     * dropped by the size cap) — the rest of the thread was still read and
+     * staged normally; this just says what's missing so a reviewer knows to
+     * ask for a re-run instead of assuming the record is complete. */
+    errors?: string[];
+  } | null;
+  const sheetOnFile = useMemo(() => {
+    const sheets = fullEmail?.sheets ?? [];
+    const hit = sheets.find((s) => s.employee_name || s.employee_id);
+    return {
+      name: hit?.employee_name ?? file?.employee_name ?? null,
+      clientId: hit?.employee_id ?? null,
+    };
+  }, [fullEmail, file?.employee_name]);
+
+  // Reset when a new file is opened.
+  useEffect(() => {
+    if (!file || file.id === prevFileId.current) return;
+    prevFileId.current = file.id;
+    setPreviewExpanded(false);
+
+    const staged = (file.extraction_meta?.staged ?? null) as {
+      employee_pk?: string | null; matched_name?: string | null;
+      matched_employee_id?: string | null; month?: number | null; year?: number | null;
+      buckets?: Record<string, string[]>;
+      working_days?: string[]; weekend_days?: string[];
+    } | null;
+    const sheets = ((file.extraction_meta?.full_email_extract ?? null) as {
+      sheets?: { employee_name?: string | null; employee_id?: string | null }[];
+    } | null)?.sheets ?? [];
+    const sheetHit = sheets.find((s) => s.employee_name || s.employee_id);
+    const sheetName = sheetHit?.employee_name ?? file.employee_name ?? "";
+
+    if (staged?.employee_pk) {
+      setEmployeePk(staged.employee_pk);
+      setEmployeeQ(
+        `${staged.matched_name ?? ""}${staged.matched_employee_id ? ` · ${staged.matched_employee_id}` : ""}`.trim()
+      );
+    } else {
+      setEmployeePk("");
+      setEmployeeQ(sheetName || file.employee_id || "");
+    }
+    setMonth(staged?.month ?? file.month ?? new Date().getMonth() + 1);
+    setYear(staged?.year ?? file.year ?? new Date().getFullYear());
+    // "working"/"weekend" aren't in staged.buckets (they're day-accounting
+    // fields, not leave — extraction keeps them as separate top-level
+    // working_days/weekend_days) but are edited through the same generic
+    // bucket UI, so fold them in here under the same short keys.
+    setDates({
+      ...(staged?.buckets ?? {}),
+      working: staged?.working_days ?? [],
+      weekend: staged?.weekend_days ?? [],
+    });
+    setAttachments([]);
+    setNote("");
+    const foundApproval = (file.extraction_meta?.full_email_extract ?? null) as {
+      approval?: { detected: boolean; detail: string; weak_evidence?: boolean };
+    } | null;
+    const approval = foundApproval?.approval;
+    setApproved(!!approval?.detected);
+    // A weak (name-only, no signature/stamp) signal is never pre-checked as
+    // Approved, but its detail is still shown — as a caution, not a
+    // confirmation — so the reviewer knows AI found *something* and why it
+    // wasn't trusted, instead of the field just being silently empty.
+    setApprovalDetail(approval?.detected || approval?.weak_evidence ? (approval?.detail ?? "") : "");
+    setApprovalWeak(!approval?.detected && !!approval?.weak_evidence);
+    setPending(false);
+    setActiveTab({ kind: "staged" });
+  }, [file]);
+
+  // Once the LIVE portal submission loads (async, so this always runs after
+  // the reset effect above finishes initializing from the staging-time
+  // snapshot), override "Manager approval" only if THIS reviewer already
+  // sent it back — there's no "approved" manager_decision value anymore
+  // (accepting a record never writes back to PortalSubmission, see
+  // review_state); otherwise leave the employee's own self-attestation
+  // (approval_claimed, baked in via portal_extract.py) in place, same as any
+  // AI-detected approval elsewhere in this form — the reviewer can still
+  // change it manually either way.
+  useEffect(() => {
+    if (!portalSubmission || portalSubmission.id !== portalSubmissionId) return;
+    if (portalSubmission.manager_decision !== "not_approved") return;
+    setApproved(false);
+    setApprovalDetail(
+      "Sent back" + (portalSubmission.manager_note ? `: "${portalSubmission.manager_note}"` : ".")
+    );
+    setApprovalWeak(false);
+  }, [portalSubmission, portalSubmissionId]);
+
+  // Land directly on THIS record's own source document, not the raw staged
+  // wrapper — a bulk thread (many employees, many attachments) otherwise
+  // forces the reviewer to hunt for the right tab among all of them. Tried
+  // exactly once per file (as soon as the thread's documents have loaded,
+  // possibly on the very next render if they're already cached — hence this
+  // runs AFTER the reset effect above, so it always has the last word for a
+  // freshly opened file), and never fights a reviewer who deliberately
+  // switches tabs afterward.
+  //
+  // Two ways a sheet's own document shows up as a doc tab:
+  //  - a plain PDF/DOCX attached directly — its filename matches a doc tab
+  //    exactly (Graph reports the same name both places).
+  //  - a nested forward: the actual PDF lives INSIDE a wrapping .eml (a bulk
+  //    "Timesheet Report - <Name> (Staff No: <ID>).eml" per employee). Graph
+  //    only ever exposes that OUTER .eml as an attachment — the inner PDF's
+  //    own derived name (what `sheets[].filename` reports) never appears as
+  //    a doc tab at all, so an exact match can never succeed here. Fall back
+  //    to matching the employee's own name/ID against the wrapper's
+  //    filename instead.
+  const autoSelectedDocFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!file || autoSelectedDocFor.current === file.id) return;
+    if (docTabs.length === 0) return;
+    const sheet = fullEmail?.sheets?.[0];
+    if (!sheet) return;
+    autoSelectedDocFor.current = file.id;
+
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    let match = docTabs.find((d) => d.filename === sheet.filename);
+    if (!match) {
+      const idNeedle = sheet.employee_id ? norm(sheet.employee_id) : "";
+      const nameNeedle = sheet.employee_name ? norm(sheet.employee_name) : "";
+      match = docTabs.find((d) => {
+        const hay = norm(d.filename);
+        return (idNeedle.length >= 3 && hay.includes(idNeedle))
+          || (nameNeedle.length >= 4 && hay.includes(nameNeedle));
+      });
+    }
+    if (match) setActiveTab({ kind: "doc", id: match.id });
+  }, [file, fullEmail, docTabs]);
+
+  const autoAcceptMeta = (file?.extraction_meta?.auto_accept ?? null) as
+    | { reasons?: string[]; blockers?: string[] }
+    | null;
+  const autoAcceptReasons = autoAcceptMeta?.reasons ?? [];
+  const autoAcceptBlockers = autoAcceptMeta?.blockers ?? [];
+
+  // Lock scroll + Escape key.
+  useEffect(() => {
+    if (!file) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !pending && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = prev;
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [file, pending, onClose]);
+
+  const selected = useMemo(
+    () => employees?.find((e) => e.id === employeePk) ?? null,
+    [employees, employeePk]
+  );
+
+  // Toggle a day in a bucket. The picker only offers days inside the record's
+  // month, so out-of-month dates can't be entered.
+  const toggleDate = (key: string, iso: string) => {
+    setDates((d) => {
+      const cur = d[key] ?? [];
+      const next = cur.includes(iso)
+        ? cur.filter((x) => x !== iso)
+        : [...cur, iso].sort();
+      return { ...d, [key]: next };
+    });
+  };
+
+  const addFiles = (list: FileList | null) => {
+    if (!list) return;
+    const valid = Array.from(list).filter((f) => ATTACHABLE_FILE_RE.test(f.name));
+    setAttachments((prev) => {
+      const names = new Set(prev.map((f) => f.name));
+      return [...prev, ...valid.filter((f) => !names.has(f.name))];
+    });
+  };
+
+  const totalDays = BUCKETS.reduce((a, b) => a + (dates[b.key]?.length ?? 0), 0);
+  const canSave = !!employeePk && month >= 1 && month <= 12 && year >= 2000 && !pending;
+
+  const currentYear = new Date().getFullYear();
+  const years = [currentYear + 1, currentYear, currentYear - 1, currentYear - 2].filter(
+    (v, i, a) => a.indexOf(v) === i
+  );
+
+  const handleDiscard = async () => {
+    if (!file || pending) return;
+    if (!isStaged) {
+      onClose();
+      return;
+    }
+    setPending(true);
+    try {
+      await deletePipelineFile(file.id);
+      toast("info", "Review item removed");
+      onDiscarded?.();
+      onClose();
+    } catch (e: any) {
+      toast("error", "Delete failed", e?.response?.data?.detail ?? String(e));
+      setPending(false);
+    }
+  };
+
+  // Distinct from Delete: Delete silently discards the staged item (used for
+  // every source), while Send back is portal-only — it leaves the staged
+  // file exactly as-is (still reviewable/acceptable later) but flips the
+  // submission to "rejected" with a mandatory note so the employee sees why
+  // and can fix/resubmit, reusing the always-editable/auto-requeue flow.
+  const openSendBack = () => {
+    if (!file || pending || !portalSubmissionId) return;
+    setSendBackNote("");
+    setSendBackOpen(true);
+  };
+
+  const confirmSendBack = async () => {
+    if (!portalSubmissionId || !sendBackNote.trim()) return;
+    setPending(true);
+    try {
+      await portalSendBack(portalSubmissionId, sendBackNote.trim());
+      toast("info", "Sent back", "The employee will see this note and can fix or replace their files.");
+      setSendBackOpen(false);
+      onDiscarded?.();
+      onClose();
+    } catch (e: any) {
+      toast("error", "Couldn't send back", e?.response?.data?.detail ?? String(e));
+      setPending(false);
+    }
+  };
+
+  const handleSave = async () => {
+    if (!file || !canSave) return;
+    setPending(true);
+    try {
+      const result = await pipelineManualFix(file.id, {
+        employee_pk: employeePk,
+        month,
+        year,
+        buckets: dates,
+        note: note || undefined,
+        approval_status: approved ? "approved" : "not_approved",
+        approval_detail: approvalDetail || undefined,
+        files: attachments,
+      });
+      const ok = result.status === "success";
+      toast(
+        ok ? "success" : "warning",
+        ok ? "Record saved & filed" : "Saved — needs review",
+        `${result.employee_name ?? selected?.name} — ${MONTHS_LONG[month]} ${year}`
+      );
+      onSaved();
+      onClose();
+    } catch (e: any) {
+      toast("error", "Could not save", e?.response?.data?.detail ?? String(e));
+      setPending(false);
+    }
+  };
+
+  if (!file) return null;
+
+  return createPortal(
+    <>
+    <div className="fixed inset-0 z-50 flex flex-col p-2 sm:p-4">
+      <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={() => !pending && onClose()} />
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl bg-white shadow-pop">
+
+        {/* Header */}
+        <div className="flex shrink-0 items-center gap-2 border-b border-slate-100 bg-slate-50 px-4 py-3">
+          <Columns2 className="h-4 w-4 text-slate-400" />
+          <span className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-700">
+            Review — {file.filename}
+          </span>
+          {file.failure_detail && (
+            <span className="hidden truncate text-xs text-rose-500 sm:block max-w-sm">
+              {file.failure_label ?? "Error"}: {file.failure_detail}
+            </span>
+          )}
+          <button
+            onClick={() => !pending && onClose()}
+            aria-label="Close"
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-white hover:text-slate-600"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {/* Two-pane body — the right pane can take over the whole modal (see
+            the maximize/minimize button in its header) when a dense sheet or
+            scanned photo needs more room than half the modal ever gives it. */}
+        <div className={cn("grid min-h-0 flex-1", previewExpanded ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}>
+
+          {/* LEFT — summary first, form second, AI/review callout last.
+              Hidden entirely while the preview is maximized. */}
+          {!previewExpanded && (
+          <div className="flex min-h-0 flex-col overflow-y-auto border-b border-slate-100 p-5 lg:border-b-0 lg:border-r">
+            {/* Extract Email breakdown — Pass 1's plain-English read of the
+                whole conversation, followed by the structured per-sheet facts
+                (kind, leave days, signature check) and the approval verdict. */}
+            {fullEmail && (
+              <div className="mb-4 space-y-3">
+                {(fullEmail.errors?.length ?? 0) > 0 && (
+                  <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <div>
+                      <p className="font-semibold">
+                        This thread was only partially read — {fullEmail.errors!.length} part
+                        {fullEmail.errors!.length === 1 ? "" : "s"} of it didn't make it into this run.
+                      </p>
+                      <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                        {fullEmail.errors!.map((e, i) => <li key={i}>{e}</li>)}
+                      </ul>
+                      <p className="mt-1">Re-running Extract Email on this thread will retry exactly what's missing.</p>
+                    </div>
+                  </div>
+                )}
+                {fullEmail.thread_summary ? (
+                  <ThreadSummaryBox summary={fullEmail.thread_summary} defaultOpen />
+                ) : fullEmail.summary ? (
+                  <p className="mb-3 rounded-lg bg-slate-50 px-3 py-2 text-xs italic text-slate-600">
+                    "{fullEmail.summary}"
+                  </p>
+                ) : null}
+
+                {((fullEmail.sheets?.length ?? 0) > 0 || fullEmail.approval) && (
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700">
+                    <p className="font-bold uppercase tracking-wide text-slate-500">
+                      Per-file detail
+                    </p>
+                    <ul className="mt-1 space-y-0.5">
+                      {(fullEmail.sheets ?? []).map((s, i) => (
+                        <li key={i} className="flex items-start gap-1.5">
+                          <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+                          <span className="min-w-0">
+                            <span className="font-semibold text-slate-800">{s.filename}</span>
+                            {" — "}
+                            {s.kind === "leave_certificate" ? "leave certificate" : s.kind}
+                            {s.leave_days ? `, ${s.leave_days} leave day(s)` : ""}
+                            {s.manager_signature ? " · manager signature ✓" : ""}
+                            {s.manager_signature && s.approval_evidence && (
+                              <span className="block text-[11px] italic text-slate-500">
+                                {s.approval_evidence}
+                              </span>
+                            )}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                    {fullEmail.approval && (
+                      <p className={cn("mt-1.5 font-semibold",
+                        fullEmail.approval.detected ? "text-emerald-700" : "text-amber-700")}>
+                        {fullEmail.approval.detail}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="mb-3 flex items-center gap-2 border-b border-slate-100 pb-2">
+              <PencilLine className="h-4 w-4 text-slate-400" />
+              <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500">
+                Manual entry
+              </h3>
+            </div>
+
+            {/* Employee */}
+            {(sheetOnFile.name || sheetOnFile.clientId) && (
+              <div className="mb-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                <span className="font-semibold uppercase tracking-wide text-slate-500">On the sheet</span>
+                <p className="mt-0.5 text-sm text-slate-800">
+                  {sheetOnFile.name ?? "Name not read"}
+                  {sheetOnFile.clientId ? (
+                    <span className="text-slate-500"> · client ID {sheetOnFile.clientId}</span>
+                  ) : null}
+                </p>
+              </div>
+            )}
+            <label className="mb-3 block">
+              <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Match to employee
+              </span>
+              <EmployeePicker
+                employees={employees}
+                isLoading={isLoading}
+                value={employeeQ}
+                valuePk={employeePk}
+                onChange={(q) => { setEmployeeQ(q); setEmployeePk(""); }}
+                onPick={(e) => {
+                  setEmployeePk(e.id);
+                  setEmployeeQ(`${e.name}${e.employee_id ? ` · ${e.employee_id}` : ""}${e.location ? ` [${e.location}]` : ""}`);
+                }}
+              />
+              {selected && (
+                <p className="mt-1 text-xs text-emerald-700">
+                  {selected.name} ({selected.employee_id}
+                  {selected.location ? ` · ${selected.location}` : ""})
+                  {selected.project ? ` · ${selected.project}` : ""}
+                  {selected.account_manager ? ` — ${selected.account_manager}` : ""}
+                </p>
+              )}
+            </label>
+
+            {/* Month + Year */}
+            <div className="mb-3 grid grid-cols-2 gap-3">
+              <label className="block">
+                <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">Month</span>
+                <Select value={String(month)} onChange={(e) => setMonth(Number(e.target.value))}>
+                  {MONTHS_LONG.map((m, i) =>
+                    i === 0 ? null : <option key={i} value={i}>{m}</option>
+                  )}
+                </Select>
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">Year</span>
+                <Select value={String(year)} onChange={(e) => setYear(Number(e.target.value))}>
+                  {years.map((y) => <option key={y} value={y}>{y}</option>)}
+                </Select>
+              </label>
+            </div>
+
+            {/* Leave buckets */}
+            <div className="mb-3 space-y-3">
+              {BUCKETS.map((b) => (
+                <div key={b.key}>
+                  <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    {b.label} <span className="text-slate-400">· {dates[b.key]?.length ?? 0}</span>
+                  </p>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {(dates[b.key] ?? []).map((d) => (
+                      <span
+                        key={d}
+                        className={cn(
+                          "inline-flex items-center gap-1 rounded-md px-2 py-1 font-mono text-[11px] font-medium ring-1 ring-inset",
+                          b.tone
+                        )}
+                      >
+                        {d}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setDates((dr) => ({
+                              ...dr,
+                              [b.key]: (dr[b.key] ?? []).filter((x) => x !== d),
+                            }))
+                          }
+                          className="opacity-60 hover:opacity-100"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </span>
+                    ))}
+                    <MonthDayPicker
+                      year={year}
+                      month={month}
+                      selected={dates[b.key] ?? []}
+                      tone={b.tone}
+                      onToggle={(iso) => toggleDate(b.key, iso)}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Manager approval — the reviewer's explicit verdict, filed on
+                the record on Accept. Pre-filled from what Extract Email found. */}
+            <div className="mb-3">
+              <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Manager approval
+              </p>
+              {approvalWeak && (
+                <div className="mb-2 flex items-start gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-xs text-amber-800">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0 translate-y-0.5" />
+                  <span>
+                    AI found only a typed name near an approval field — no signature,
+                    stamp, or status mark. Not auto-marked as approved; verify by hand.
+                  </span>
+                </div>
+              )}
+              <div className="inline-flex rounded-lg border border-slate-300 p-0.5">
+                <button
+                  type="button"
+                  onClick={() => { setApproved(true); setApprovalWeak(false); }}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors",
+                    approved
+                      ? "bg-emerald-600 text-white shadow-sm"
+                      : "text-slate-600 hover:bg-slate-100"
+                  )}
+                >
+                  <CheckCircle2 className="h-3.5 w-3.5" /> Approved
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setApproved(false); setApprovalWeak(false); }}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors",
+                    !approved
+                      ? "bg-slate-700 text-white shadow-sm"
+                      : "text-slate-600 hover:bg-slate-100"
+                  )}
+                >
+                  <X className="h-3.5 w-3.5" /> Not approved
+                </button>
+              </div>
+              <input
+                value={approvalDetail}
+                onChange={(e) => setApprovalDetail(e.target.value)}
+                placeholder={approved
+                  ? 'Evidence, e.g. "Approved — Sylvia Noronha, 2 Jul 2026"'
+                  : "Why not approved (optional)"}
+                className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
+              />
+            </div>
+
+            {/* File attachments */}
+            <div className="mb-3">
+              <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Attach files (optional)
+              </p>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept=".pdf,.docx,.xlsx,.png,.jpg,.jpeg,.eml,.msg"
+                className="hidden"
+                onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }}
+              />
+              <Button variant="secondary" size="sm" onClick={() => fileInputRef.current?.click()}>
+                <Paperclip className="h-4 w-4" /> Add files
+              </Button>
+              {attachments.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {attachments.map((f) => (
+                    <div key={f.name} className="flex items-center gap-2 rounded-lg border border-slate-200 px-2.5 py-1.5">
+                      <FileText className="h-4 w-4 shrink-0 text-slate-400" />
+                      <span className="min-w-0 flex-1 truncate text-xs text-slate-700">{f.name}</span>
+                      <span className="text-[11px] text-slate-400">{formatBytes(f.size)}</span>
+                      <button
+                        type="button"
+                        onClick={() => setAttachments((a) => a.filter((x) => x.name !== f.name))}
+                        className="rounded p-0.5 text-slate-400 hover:text-rose-500"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Note */}
+            <div className="mb-4">
+              <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Note (optional)
+              </p>
+              <input
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="e.g. 'Confirmed with manager — Danial Gohar May 2026'"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
+              />
+            </div>
+
+            {/* Banner — AI recommendation, held for review, or failure. Kept
+                below manual entry so the thread summary stays topmost. */}
+            {isStaged && aiRecommends ? (
+              <div className="mb-4 rounded-xl border border-emerald-200 bg-emerald-50/80 p-3 text-sm leading-5 shadow-sm">
+                <p className="flex items-center gap-1.5 font-semibold text-emerald-900">
+                  <Sparkles className="h-4 w-4 shrink-0 text-emerald-600" />
+                  AI recommends accepting
+                </p>
+                <p className="mt-1 text-slate-700">
+                  Extraction looks clean — compare with the file on the right, then press{" "}
+                  <strong>Accept &amp; file record</strong> to store it. Nothing is saved until you do.
+                </p>
+                {autoAcceptReasons.length > 0 && (
+                  <ul className="mt-2 space-y-1 text-xs leading-relaxed text-emerald-900/90">
+                    {autoAcceptReasons.map((r, i) => (
+                      <li key={i} className="flex gap-1.5">
+                        <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                        <span>{r}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : isStaged ? (
+              <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50/80 p-3 text-sm leading-5 shadow-sm">
+                <p className="flex items-center gap-1.5 font-semibold text-amber-900">
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
+                  Needs your review
+                </p>
+                <p className="mt-1 text-slate-700">
+                  The AI wasn't fully sure about this one. Check the details, fix anything
+                  wrong, then press <strong>Accept &amp; file record</strong>.
+                </p>
+                {autoAcceptBlockers.length > 0 && (
+                  <div className="mt-2 rounded-lg border border-amber-100 bg-white/80 p-2.5">
+                    <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-amber-700">
+                      What it wasn't sure about
+                    </p>
+                    <ul className="space-y-1 text-xs leading-relaxed text-slate-700">
+                      {autoAcceptBlockers.map((b, i) => (
+                        <li key={i} className="flex gap-1.5">
+                          <span className="mt-0.5 shrink-0 text-amber-500">•</span>
+                          <span>{humanizeBlocker(b)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            ) : file.failure_detail ? (
+              <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50/80 p-3 text-sm leading-5 text-rose-800 shadow-sm">
+                <p className="font-semibold">{file.failure_label ?? "Failed"}</p>
+                <p className="mt-0.5">{file.failure_detail}</p>
+              </div>
+            ) : null}
+
+            {/* Actions */}
+            <div className="flex items-center gap-3 border-t border-slate-100 pt-4">
+              <span className="flex-1 text-xs text-slate-400">{totalDays} day(s) entered</span>
+              <Button variant="secondary" onClick={handleDiscard} disabled={pending}>
+                {isStaged ? (
+                  <>
+                    <Trash2 className="h-4 w-4" />
+                    Delete
+                  </>
+                ) : (
+                  "Cancel"
+                )}
+              </Button>
+              {isStaged && file.source_kind === "portal" && portalSubmissionId && (
+                <Button variant="secondary" onClick={openSendBack} disabled={pending}>
+                  <Undo2 className="h-4 w-4" />
+                  Send back
+                </Button>
+              )}
+              <Button disabled={!canSave} onClick={handleSave}>
+                {pending ? (
+                  <Spinner className="border-white/40 border-t-white" />
+                ) : (
+                  <PencilLine className="h-4 w-4" />
+                )}
+                {isStaged ? "Accept & file record" : "Save & file record"}
+              </Button>
+            </div>
+          </div>
+          )}
+
+          {/* RIGHT — source preview, switchable between the staged file (the
+              full thread, viewable there via its own attachments list) and
+              every real document/screenshot attachment across the whole
+              thread, so everything can be cross-checked without leaving
+              Compare & Fix. */}
+          <div className="flex min-h-0 flex-col bg-slate-100">
+            <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-3 py-2">
+              <FileText className="h-3.5 w-3.5 text-slate-400" />
+              <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-600">
+                {activeDoc ? activeDoc.filename : file.filename}
+              </span>
+              <a
+                href={activeDoc ? activeDoc.url : pipelineRawUrl(file.id)}
+                download={(activeDoc ? activeDoc.filename : file.filename) ?? "file"}
+                className="rounded p-1 text-slate-400 hover:text-brand-600"
+                title="Download original"
+              >
+                <Download className="h-3.5 w-3.5" />
+              </a>
+              <button
+                type="button"
+                onClick={() => setPreviewExpanded((v) => !v)}
+                className="rounded p-1 text-slate-400 hover:text-brand-600"
+                title={previewExpanded ? "Restore split view" : "Expand preview to full screen"}
+              >
+                {previewExpanded ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+            {docTabs.length > 0 && (
+              <div className="flex max-h-24 shrink-0 flex-wrap items-center gap-1.5 overflow-y-auto border-b border-slate-200 bg-white/70 px-3 py-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab({ kind: "staged" })}
+                  className={cn(
+                    "rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ring-inset transition-colors",
+                    activeTab.kind === "staged"
+                      ? "bg-brand-600 text-white ring-brand-600"
+                      : "bg-white text-slate-600 ring-slate-200 hover:bg-brand-50"
+                  )}
+                >
+                  Staged file
+                </button>
+                {docTabs.map((s) => (
+                  <button
+                    key={s.id}
+                    type="button"
+                    onClick={() => setActiveTab({ kind: "doc", id: s.id })}
+                    title={s.filename}
+                    className={cn(
+                      "max-w-[180px] truncate rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ring-inset transition-colors",
+                      activeTab.kind === "doc" && activeTab.id === s.id
+                        ? "bg-brand-600 text-white ring-brand-600"
+                        : "bg-white text-slate-600 ring-slate-200 hover:bg-brand-50"
+                    )}
+                  >
+                    {s.filename}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="min-h-0 flex-1 overflow-auto p-2">
+              {activeDoc ? (
+                <SourcePreview
+                  url={activeDoc.url}
+                  renderUrl={activeDoc.renderUrl}
+                  name={activeDoc.filename}
+                  ct={activeDoc.ct}
+                />
+              ) : (
+                <RawFilePreview file={file} />
+              )}
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <Modal
+      open={sendBackOpen}
+      onClose={() => !pending && setSendBackOpen(false)}
+      title="Send back to employee"
+      subtitle="They'll see this note on the submission and can fix or replace their files."
+    >
+      <div className="space-y-4">
+        <textarea
+          autoFocus
+          rows={4}
+          value={sendBackNote}
+          onChange={(e) => setSendBackNote(e.target.value)}
+          placeholder="e.g. 'Missing manager signature on page 2 — please re-upload with approval.'"
+          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-4 focus:ring-brand-500/10"
+        />
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => setSendBackOpen(false)} disabled={pending}>
+            Cancel
+          </Button>
+          <Button onClick={confirmSendBack} disabled={pending || !sendBackNote.trim()}>
+            {pending && <Spinner className="border-white/40 border-t-white" />}
+            Send back
+          </Button>
+        </div>
+      </div>
+    </Modal>
+    </>,
+    document.body
+  );
+}

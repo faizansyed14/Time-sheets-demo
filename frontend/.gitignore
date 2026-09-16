@@ -1,0 +1,10 @@
+node_modules
+dist
+.demo-store.json
+*.local
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+*.tsbuildinfo

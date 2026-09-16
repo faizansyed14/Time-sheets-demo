@@ -1,0 +1,505 @@
+/**
+ * In-browser XLSX/XLS preview — a real spreadsheet grid (not a page image).
+ *
+ * Modern .xlsx renders with ExcelJS (reads cell fill/font/border, not just
+ * values — the SheetJS community build drops all of that, and fill colour is
+ * exactly what these timesheets use to encode leave-type legends). Legacy
+ * binary .xls (which ExcelJS cannot read at all — it only understands the
+ * OOXML/ZIP format) falls back to SheetJS, which DOES understand the old
+ * BIFF format — text/values only, no fill/font/border, but that's enough for
+ * a plain tabular sheet. One continuous scrollable table per sheet, with a
+ * tab bar when a workbook has more than one sheet, and a search box that
+ * filters rows by any cell's text (e.g. finding one employee's row in a long
+ * roster) — no click-through pagination.
+ */
+import { useEffect, useMemo, useState } from "react";
+import { Search as SearchIcon } from "lucide-react";
+import { cn } from "../lib/utils";
+import { Spinner } from "./ui";
+import { ServerRenderPane } from "./FilePreview";
+
+// Generous ceilings, not a real page size — a long PGC-style roster (one row
+// per employee PER DAY) can genuinely run past 1,000 rows for one month, and
+// the whole point of the search box is finding one employee in the FULL
+// sheet, not just whatever fit in the first slice. Only a truly pathological
+// file (a million-row CSV saved as .xls by mistake) would ever hit these.
+const MAX_ROWS = 20000;
+const MAX_COLS = 200;
+
+interface CellModel {
+  text: string;
+  colSpan: number;
+  rowSpan: number;
+  style: React.CSSProperties;
+}
+
+interface SheetModel {
+  name: string;
+  colWidths: number[];
+  rows: { heightPx: number; cells: (CellModel | null)[] }[];
+  truncatedRows: boolean;
+  truncatedCols: boolean;
+}
+
+function decodeAddress(addr: string): { row: number; col: number } {
+  const m = /^([A-Z]+)(\d+)$/.exec(addr.trim());
+  if (!m) return { row: 1, col: 1 };
+  let col = 0;
+  for (const ch of m[1]) col = col * 26 + (ch.charCodeAt(0) - 64);
+  return { row: Number(m[2]), col };
+}
+
+type MergeRange = { top: number; left: number; bottom: number; right: number };
+
+function parseMerges(raw: unknown): MergeRange[] {
+  if (!Array.isArray(raw)) return [];
+  const out: MergeRange[] = [];
+  for (const m of raw) {
+    if (typeof m === "string") {
+      const [a, b] = m.split(":");
+      if (!a || !b) continue;
+      const A = decodeAddress(a), B = decodeAddress(b);
+      out.push({
+        top: Math.min(A.row, B.row), bottom: Math.max(A.row, B.row),
+        left: Math.min(A.col, B.col), right: Math.max(A.col, B.col),
+      });
+    } else if (m && typeof m === "object" && "top" in (m as any)) {
+      const mm = m as any;
+      out.push({ top: mm.top, bottom: mm.bottom, left: mm.left, right: mm.right });
+    }
+  }
+  return out;
+}
+
+function argbToCss(argb?: string): string | undefined {
+  if (!argb || argb.length < 6) return undefined;
+  const hex = argb.length >= 8 ? argb.slice(-6) : argb;
+  return `#${hex}`;
+}
+
+function fillBg(fill: any): string | undefined {
+  if (!fill || fill.type !== "pattern" || fill.pattern !== "solid") return undefined;
+  return argbToCss(fill.fgColor?.argb);
+}
+
+function fontStyle(font: any): React.CSSProperties {
+  if (!font) return {};
+  const style: React.CSSProperties = {};
+  if (font.bold) style.fontWeight = 700;
+  if (font.italic) style.fontStyle = "italic";
+  if (font.underline) style.textDecoration = "underline";
+  if (font.size) style.fontSize = `${Math.max(10, Math.min(20, font.size))}px`;
+  const c = argbToCss(font.color?.argb);
+  if (c) style.color = c;
+  return style;
+}
+
+function alignStyle(al: any): React.CSSProperties {
+  if (!al) return {};
+  const style: React.CSSProperties = {};
+  if (al.horizontal) style.textAlign = al.horizontal;
+  if (al.vertical) style.verticalAlign = al.vertical === "middle" ? "middle" : al.vertical;
+  if (al.wrapText) style.whiteSpace = "pre-wrap";
+  return style;
+}
+
+function borderSide(b: any): string | undefined {
+  if (!b || !b.style) return undefined;
+  const color = argbToCss(b.color?.argb) ?? "#cbd5e1";
+  const width = b.style === "thick" ? 2 : b.style === "medium" ? 1.5 : 1;
+  return `${width}px solid ${color}`;
+}
+
+function cellText(cell: any): string {
+  const v = cell.value;
+  if (v == null) return "";
+  if (typeof v === "object") {
+    if (v instanceof Date) return v.toLocaleDateString();
+    if (Array.isArray(v.richText)) return v.richText.map((r: any) => r.text ?? "").join("");
+    if ("result" in v) return v.result == null ? "" : String(v.result);
+    if ("text" in v) return String(v.text);
+    if ("error" in v) return String(v.error);
+    return "";
+  }
+  return String(v);
+}
+
+const colWidthPx = (charWidth: number | undefined) => Math.round((charWidth ?? 8.43) * 7 + 5);
+const rowHeightPx = (pt: number | undefined) => Math.round((pt ?? 15) * 1.333);
+
+function buildSheetModel(ws: any): SheetModel {
+  const lastRow = Math.min(ws.rowCount || 0, MAX_ROWS);
+  const lastCol = Math.min(ws.columnCount || 0, MAX_COLS);
+  const merges = parseMerges(ws.model?.merges);
+  const mergeSpan = new Map<string, { rowSpan: number; colSpan: number }>();
+  const covered = new Set<string>();
+  for (const m of merges) {
+    mergeSpan.set(`${m.top}:${m.left}`, { rowSpan: m.bottom - m.top + 1, colSpan: m.right - m.left + 1 });
+    for (let r = m.top; r <= m.bottom; r++) {
+      for (let c = m.left; c <= m.right; c++) {
+        if (r === m.top && c === m.left) continue;
+        covered.add(`${r}:${c}`);
+      }
+    }
+  }
+
+  const colWidths: number[] = [];
+  for (let c = 1; c <= lastCol; c++) colWidths.push(colWidthPx(ws.getColumn(c).width));
+
+  const rows: SheetModel["rows"] = [];
+  for (let r = 1; r <= lastRow; r++) {
+    const row = ws.getRow(r);
+    const cells: (CellModel | null)[] = [];
+    for (let c = 1; c <= lastCol; c++) {
+      const key = `${r}:${c}`;
+      if (covered.has(key)) { cells.push(null); continue; }
+      const cell = row.getCell(c);
+      const span = mergeSpan.get(key);
+      const style: React.CSSProperties = { ...alignStyle(cell.alignment), ...fontStyle(cell.font) };
+      const bg = fillBg(cell.fill);
+      if (bg) style.backgroundColor = bg;
+      const bt = borderSide(cell.border?.top);
+      const bb = borderSide(cell.border?.bottom);
+      const bl = borderSide(cell.border?.left);
+      const br = borderSide(cell.border?.right);
+      if (bt) style.borderTop = bt;
+      if (bb) style.borderBottom = bb;
+      if (bl) style.borderLeft = bl;
+      if (br) style.borderRight = br;
+      cells.push({
+        text: cellText(cell),
+        colSpan: span?.colSpan ?? 1,
+        rowSpan: span?.rowSpan ?? 1,
+        style,
+      });
+    }
+    rows.push({ heightPx: rowHeightPx(row.height), cells });
+  }
+
+  return {
+    name: ws.name || "Sheet",
+    colWidths,
+    rows,
+    truncatedRows: (ws.rowCount || 0) > MAX_ROWS,
+    truncatedCols: (ws.columnCount || 0) > MAX_COLS,
+  };
+}
+
+// SheetJS's own column-width unit (characters) matches ExcelJS's — same
+// conversion applies.
+function buildSheetModelFromSheetJS(XLSXmod: any, ws: any, name: string): SheetModel {
+  const ref = ws["!ref"];
+  if (!ref) return { name, colWidths: [], rows: [], truncatedRows: false, truncatedCols: false };
+  const range = XLSXmod.utils.decode_range(ref);
+  const totalRows = range.e.r - range.s.r + 1;
+  const totalCols = range.e.c - range.s.c + 1;
+  const lastRow = Math.min(totalRows, MAX_ROWS);
+  const lastCol = Math.min(totalCols, MAX_COLS);
+
+  const colInfo: any[] = ws["!cols"] || [];
+  const colWidths: number[] = [];
+  for (let c = 0; c < lastCol; c++) colWidths.push(colWidthPx(colInfo[c]?.wch));
+
+  const rows: SheetModel["rows"] = [];
+  for (let r = 0; r < lastRow; r++) {
+    const cells: (CellModel | null)[] = [];
+    for (let c = 0; c < lastCol; c++) {
+      const addr = XLSXmod.utils.encode_cell({ r: range.s.r + r, c: range.s.c + c });
+      const cell = ws[addr];
+      // `.w` is the formatted display text (dates/numbers rendered per the
+      // cell's own number format) when SheetJS computed one; `.v` is the
+      // raw value otherwise. No fill/font/border — SheetJS's community
+      // build doesn't carry those for legacy BIFF the way ExcelJS does for
+      // OOXML, but plain tabular text is exactly what this fallback is for.
+      const text = cell == null ? "" : String(cell.w ?? cell.v ?? "");
+      cells.push({ text, colSpan: 1, rowSpan: 1, style: {} });
+    }
+    rows.push({ heightPx: rowHeightPx(undefined), cells });
+  }
+
+  return {
+    name,
+    colWidths,
+    rows,
+    truncatedRows: totalRows > MAX_ROWS,
+    truncatedCols: totalCols > MAX_COLS,
+  };
+}
+
+async function loadLegacyXlsWorkbook(url: string): Promise<SheetModel[]> {
+  // Lazy-loaded, same as the ExcelJS path — only paid for when actually
+  // needed (a genuine legacy .xls hits this fallback).
+  const XLSX: any = await import("xlsx");
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = await res.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array" });
+  const models = (wb.SheetNames as string[]).map((name) =>
+    buildSheetModelFromSheetJS(XLSX, wb.Sheets[name], name));
+  return models.length ? models : [{
+    name: "Sheet1", colWidths: [], rows: [], truncatedRows: false, truncatedCols: false,
+  }];
+}
+
+// Rollup wraps this CJS bundle in its own commonjs-interop namespace, and
+// that wrapper's shape (which key holds the real module — `.default`,
+// `.e.__moduleExports`, etc.) is an internal Rollup implementation detail
+// that already changed across a rebuild here. Scan for the constructor by
+// shape instead of hardcoding a key path that the next bundler version is
+// free to rename.
+function findWorkbookCtor(node: unknown, depth = 0): any {
+  if (!node || typeof node !== "object" || depth > 4) return undefined;
+  const o = node as Record<string, unknown>;
+  if (typeof o.Workbook === "function") return o.Workbook;
+  for (const key of Object.keys(o)) {
+    const found = findWorkbookCtor(o[key], depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+// A real .xlsx is a ZIP (OOXML). Anything with this header instead is the
+// legacy OLE2/Compound-File container — either an old binary .xls saved
+// with an .xlsx extension, or a rights-managed (IRM/RMS) file, which ECMA-376
+// stores as an encrypted stream inside the SAME container type. ExcelJS's
+// ZIP parser fails on either with a cryptic "not a zip file" error, so this
+// is checked up front to give an honest, specific message instead.
+const OLE_SIGNATURE = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+
+function isOleCompoundFile(bytes: Uint8Array): boolean {
+  return OLE_SIGNATURE.every((b, i) => bytes[i] === b);
+}
+
+// "Microsoft.Metadata.DRMTransform" / "EncryptedPackage" are the standard
+// [MS-OFFCRYPTO] markers for an Information-Rights-Management-protected
+// Office file, stored as plain ASCII inside the container's DataSpaces
+// stream — cheap to spot without a real OLE2 directory parser.
+function looksRightsProtected(bytes: Uint8Array): boolean {
+  const text = new TextDecoder("latin1").decode(bytes);
+  return text.includes("DRMTransform") || text.includes("EncryptedPackage")
+    || text.includes("MicrosoftIRMServices");
+}
+
+async function loadWorkbook(url: string) {
+  // Lazy-loaded — only users who actually open an XLSX preview pay for the
+  // parser. The browser build (package.json "browser" field) is imported by
+  // subpath directly so the choice isn't left to bundler field-resolution.
+  const mod: unknown = await import("exceljs/dist/exceljs.min.js");
+  const Workbook = findWorkbookCtor(mod);
+  if (!Workbook) throw new Error("exceljs browser bundle did not expose Workbook");
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = await res.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  if (isOleCompoundFile(bytes)) {
+    throw new Error(looksRightsProtected(bytes) ? "RIGHTS_PROTECTED" : "LEGACY_XLS_FORMAT");
+  }
+  const wb = new Workbook();
+  await wb.xlsx.load(buf);
+  return wb;
+}
+
+export function XlsxPreviewPane({ url }: { url: string }) {
+  const [sheets, setSheets] = useState<SheetModel[] | null>(null);
+  const [active, setActive] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
+  const [pageFallback, setPageFallback] = useState(false);
+  const [usedLegacyParser, setUsedLegacyParser] = useState(false);
+  const [search, setSearch] = useState("");
+
+  const sheet = sheets ? sheets[active] : null;
+  const term = search.trim().toLowerCase();
+  // Computed unconditionally (before the loading/error early-returns below)
+  // — hooks can never be called only on SOME renders.
+  const filteredRows = useMemo(
+    () => (sheet
+      ? (term ? sheet.rows.filter((row) => row.cells.some((c) => c && c.text.toLowerCase().includes(term))) : sheet.rows)
+      : []),
+    [sheet, term]
+  );
+
+  useEffect(() => {
+    let alive = true;
+    setSheets(null);
+    setError(null);
+    setErrorCode(null);
+    setPageFallback(false);
+    setUsedLegacyParser(false);
+    setSearch("");
+    setActive(0);
+    loadWorkbook(url)
+      .then((wb) => {
+        if (!alive) return;
+        const models = wb.worksheets
+          .filter((ws: any) => ws.state !== "hidden" && ws.state !== "veryHidden")
+          .map(buildSheetModel);
+        setSheets(models.length ? models : [{
+          name: "Sheet1", colWidths: [], rows: [], truncatedRows: false, truncatedCols: false,
+        }]);
+      })
+      .catch(async (e) => {
+        const code = e instanceof Error ? e.message : "";
+        // ExcelJS can only read modern OOXML — a genuine legacy .xls (not
+        // rights-protected, just old) is real, readable data that SheetJS
+        // CAN parse directly from the same bytes. Try that automatically
+        // instead of just showing an error — this is what makes .xls
+        // actually previewable, not merely download-only.
+        if (code === "LEGACY_XLS_FORMAT") {
+          try {
+            const models = await loadLegacyXlsWorkbook(url);
+            if (!alive) return;
+            setUsedLegacyParser(true);
+            setSheets(models);
+            return;
+          } catch (e2) {
+            if (!alive) return;
+            console.error("Legacy .xls preview also failed:", e2);
+            setErrorCode(code);
+            setError(
+              "This older Excel format (.xls) couldn't be read directly either — "
+              + "please download this file and compare it against what's shown on the other side.");
+            return;
+          }
+        }
+        if (!alive) return;
+        console.error("XLSX preview failed:", e);
+        setErrorCode(code);
+        setError(
+          code === "RIGHTS_PROTECTED"
+            ? "This spreadsheet is rights-protected (encrypted) — it can't be previewed here. Download it and open in Excel with the right permissions."
+            : "Could not read this spreadsheet."
+        );
+      });
+    return () => { alive = false; };
+  }, [url]);
+
+  // A legacy binary .xls (real content, just an .xlsx extension) has no
+  // ZIP/OOXML structure for ExcelJS to read, but LibreOffice on the server
+  // can still open it — offered as an explicit fallback, not the default, so
+  // a genuinely modern .xlsx never regresses back to page images.
+  if (pageFallback) {
+    return (
+      <div className="h-full overflow-hidden">
+        <ServerRenderPane sourceUrl={url} filename="sheet.xlsx" contentType="application/vnd.ms-excel" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center text-sm text-rose-500">
+        <p>{error}</p>
+        {errorCode === "LEGACY_XLS_FORMAT" && (
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <a
+              href={url}
+              download
+              className="rounded-lg border border-brand-200 bg-brand-50 px-3 py-1.5 text-xs font-semibold text-brand-700 hover:bg-brand-100"
+            >
+              Download original file
+            </a>
+            <button
+              type="button"
+              onClick={() => setPageFallback(true)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              Try a page-image preview instead
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+  if (!sheets || !sheet) {
+    return <div className="flex h-full items-center justify-center"><Spinner className="h-6 w-6" /></div>;
+  }
+
+  return (
+    <div className="flex h-full flex-col">
+      {sheets.length > 1 && (
+        <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-slate-200 bg-slate-50 px-2 py-1.5">
+          {sheets.map((s, i) => (
+            <button
+              key={s.name + i}
+              type="button"
+              onClick={() => setActive(i)}
+              className={cn(
+                "shrink-0 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+                i === active
+                  ? "bg-white text-brand-700 shadow-xs ring-1 ring-slate-200"
+                  : "text-slate-500 hover:text-slate-700"
+              )}
+            >
+              {s.name}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-3 py-1.5">
+        <SearchIcon className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search this sheet — e.g. a name or ID…"
+          className="min-w-0 flex-1 bg-transparent text-xs text-slate-700 placeholder:text-slate-400 focus:outline-none"
+        />
+        {term && (
+          <span className="shrink-0 text-[11px] font-medium text-slate-400">
+            {filteredRows.length} / {sheet.rows.length} row{sheet.rows.length === 1 ? "" : "s"}
+          </span>
+        )}
+      </div>
+      {usedLegacyParser && (
+        <div className="shrink-0 border-b border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-700">
+          Legacy .xls format — showing cell text only (colours/fonts aren't available in this view).{" "}
+          <a href={url} download className="font-semibold underline hover:no-underline">
+            Download the original
+          </a>{" "}
+          to see it exactly as saved.
+        </div>
+      )}
+      {(sheet.truncatedRows || sheet.truncatedCols) && (
+        <div className="shrink-0 border-b border-amber-200 bg-amber-50 px-3 py-1 text-[11px] text-amber-700">
+          Showing the first {MAX_ROWS} rows / {MAX_COLS} columns of a larger sheet.
+        </div>
+      )}
+      <div className="min-h-0 flex-1 overflow-auto bg-white">
+        {sheet.rows.length === 0 ? (
+          <div className="flex h-full items-center justify-center p-8 text-sm text-slate-400">
+            (empty spreadsheet)
+          </div>
+        ) : filteredRows.length === 0 ? (
+          <div className="flex h-full items-center justify-center p-8 text-sm text-slate-400">
+            No rows match "{search.trim()}".
+          </div>
+        ) : (
+          <table className="border-collapse text-[12px] leading-tight text-slate-800" style={{ tableLayout: "fixed" }}>
+            <colgroup>
+              {sheet.colWidths.map((w, i) => <col key={i} style={{ width: w }} />)}
+            </colgroup>
+            <tbody>
+              {filteredRows.map((row, ri) => (
+                <tr key={ri} style={{ height: row.heightPx }}>
+                  {row.cells.map((cell, ci) =>
+                    cell === null ? null : (
+                      <td
+                        key={ci}
+                        colSpan={cell.colSpan}
+                        rowSpan={cell.rowSpan}
+                        className="overflow-hidden truncate border border-slate-200 px-1.5 py-0.5"
+                        style={cell.style}
+                      >
+                        {cell.text}
+                      </td>
+                    )
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
